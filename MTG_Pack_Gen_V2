@@ -1,0 +1,971 @@
+#!/usr/bin/env python3
+"""
+MTG Booster Packs for Tabletop Simulator — clickable, openable packs.
+
+A companion to mtg_draft_night.py (which stays untouched). Instead of
+spawning bare face-down decks, this script creates booster PACK objects:
+each pack sits on the table showing wrapper art with an "Open" button.
+Clicking Open makes the pack vanish and its 15 cards appear as a
+face-down deck in its place.
+
+Like mtg_draft_night.py, all card images are downloaded locally so TTS
+never has to talk to Scryfall (which blocks TTS's downloader).
+
+Usage:
+    # Normal draft-style booster generation
+    python mtg_booster_packs.py --set ktk --packs 24
+    python mtg_booster_packs.py --set dsk --players 4 --packs-per-player 3
+
+    # Non-draftable/special product: make 15-card packs from the whole set
+    python mtg_booster_packs.py --set sld --mode pool --packs 24
+
+    # Traditional-feeling rarity slots for a non-booster product
+    python mtg_booster_packs.py --set who --mode weighted --packs 24
+
+    # Spawn all packs in one vertical stack instead of a grid
+    python mtg_booster_packs.py --set who --mode weighted --packs 24 --layout stack
+
+    # Secret Lair/custom pool using a Scryfall search query
+    python mtg_booster_packs.py --query "set:sld" --cards-per-pack 5 --packs 24
+
+    # Discover current Scryfall special-set codes
+    python mtg_booster_packs.py --list-special-sets
+
+    # Use a custom number of cards per pool pack
+    python mtg_booster_packs.py --set who --mode pool --cards-per-pack 10 --packs 24
+
+    # Any Scryfall search query can define the card pool
+    python mtg_booster_packs.py --query "set:sld color:g" --cards-per-pack 8 --packs 12
+
+Wrapper art: if the Pillow library is installed (pip install pillow),
+the script generates a styled wrapper per set automatically. Without
+Pillow it falls back to the MTG card back, or use --pack-art to supply
+your own image.
+
+Requires Python 3.8+. Pillow is optional but recommended.
+"""
+
+import argparse
+import json
+import os
+import random
+import shutil
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+SCRYFALL_API = "https://api.scryfall.com/cards/search"
+USER_AGENT = "MTGDraftNightTTS/1.0 (personal draft-night script)"
+
+CARD_BACK_URL = (
+    "https://backs.scryfall.io/large/0/a/0aeebaf5-8c7d-4636-9e82-8c27447861f7.jpg"
+)
+
+MYTHIC_CHANCE = 1 / 8
+
+
+# ---------------------------------------------------------------------------
+# Scryfall fetching (same approach as mtg_draft_night.py)
+# ---------------------------------------------------------------------------
+
+def fetch_json(url):
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT,
+                                               "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        # Scryfall answers zero-result searches with HTTP 404.
+        return {"object": "error", "status": e.code}
+
+
+def fetch_set_meta(set_code):
+    """Set name, release date, and printed card count from Scryfall."""
+    try:
+        data = fetch_json(f"https://api.scryfall.com/sets/{set_code.lower()}")
+        if data.get("object") == "set":
+            return (data.get("name", set_code.upper()),
+                    data.get("released_at", ""),
+                    data.get("card_count", 0))
+    except Exception:
+        pass
+    return set_code.upper(), "", 0
+
+
+def fetch_cards_query(query, unique="cards"):
+    """Fetch all cards matching an arbitrary Scryfall search query."""
+    cards = []
+    url = SCRYFALL_API + "?" + urllib.parse.urlencode({
+        "q": query, "unique": unique, "order": "set"
+    })
+    while url:
+        data = fetch_json(url)
+        if data.get("object") == "error":
+            break
+        cards.extend(data.get("data", []))
+        url = data.get("next_page")
+        time.sleep(0.1)
+    return cards
+
+
+def fetch_set_cards(set_code, released_at="", use_booster_filter=True):
+    """Fetch a set's draftable cards.
+
+    Scryfall's per-card is:booster flag keeps planeswalker-deck and promo
+    cards out of modern packs, but it's incomplete for old sets (Urza's
+    Legacy loses 40 cards to it). Sets released before 2014 predate
+    non-booster cards in main set files entirely, so they get the plain
+    unfiltered query; newer sets use is:booster with a plain fallback.
+    """
+    if use_booster_filter and released_at and released_at < "2014-01-01":
+        queries = [f"e:{set_code}"]
+    elif use_booster_filter:
+        queries = [f"e:{set_code} is:booster", f"e:{set_code}"]
+    else:
+        queries = [f"e:{set_code}"]
+    for query in queries:
+        cards = fetch_cards_query(query)
+        if cards:
+            return cards
+    sys.exit(f"No cards found for set code '{set_code}'. "
+             f"Check the code at scryfall.com/sets.")
+
+
+
+def fetch_special_printings(set_code, include_promos=False, include_variants=False):
+    """Find printings in the requested set and its matching p-prefixed promo set.
+
+    Keep individual printings (unique=prints) rather than collapsing artwork.
+    A p-prefixed set is used only if it actually exists on Scryfall.
+    """
+    codes = [set_code]
+    if include_promos and not set_code.startswith("p"):
+        promo_code = "p" + set_code
+        meta = fetch_json(f"https://api.scryfall.com/sets/{promo_code}")
+        if meta.get("object") == "set":
+            codes.append(promo_code)
+    found = {}
+    for code in codes:
+        for card in fetch_cards_query(f"e:{code}", unique="prints"):
+            if not image_url(card):
+                continue
+            is_promo = bool(card.get("promo")) or card.get("set_type") == "promo" or code != set_code
+            is_variant = bool(card.get("full_art")) or card.get("frame_effects") or card.get("border_color") == "borderless" or bool(card.get("variation")) or bool(card.get("finishes") and "etched" in card["finishes"])
+            # Include alternate-art printings that have neither explicit promo
+            # nor frame flags: Scryfall's illustration_id distinguishes art.
+            if include_promos and is_promo or include_variants and is_variant:
+                found[card_key(card)] = card
+    return list(found.values())
+
+
+def substitute_specials(packs, specials, chance, rng):
+    """Replace cards with special printings of the same game card.
+
+    Preserves rarity distribution and pack size, including double-faced cards.
+    """
+    by_oracle = {}
+    for card in specials:
+        oracle = card.get("oracle_id")
+        if oracle:
+            by_oracle.setdefault(oracle, []).append(card)
+    swaps = 0
+    for pack in packs:
+        for index, card in enumerate(pack):
+            candidates = by_oracle.get(card.get("oracle_id"), [])
+            candidates = [c for c in candidates if card_key(c) != card_key(card)]
+            if candidates and rng.random() < chance:
+                pack[index] = rng.choice(candidates)
+                swaps += 1
+    return swaps
+
+
+def face_image_url(card, face_index=0):
+    """Return a Scryfall image URL for a particular face of a card.
+
+    Double-faced cards (transform/modal DFC/etc.) commonly store their images
+    in card_faces rather than at the top level.
+    """
+    faces = card.get("card_faces") or []
+    if faces and 0 <= face_index < len(faces):
+        face = faces[face_index]
+        uris = face.get("image_uris") or {}
+        url = uris.get("normal") or uris.get("large") or uris.get("png")
+        if url:
+            return url.split("?")[0]
+
+    # Single-faced cards, and some Scryfall layouts, store the image here.
+    if face_index == 0:
+        uris = card.get("image_uris") or {}
+        url = uris.get("normal") or uris.get("large") or uris.get("png")
+        if url:
+            return url.split("?")[0]
+    return None
+
+
+def image_url(card):
+    """Return the front-face image URL (legacy helper)."""
+    return face_image_url(card, 0)
+
+
+def back_image_url(card):
+    """Return the actual reverse face for double-faced cards, if present."""
+    faces = card.get("card_faces") or []
+    if len(faces) >= 2:
+        return face_image_url(card, 1)
+    return None
+
+
+def has_distinct_back_face(card):
+    """True when Scryfall supplies a separate image for the card's reverse."""
+    return bool(back_image_url(card))
+
+
+def bucket_by_rarity(cards):
+    buckets = {"common": [], "uncommon": [], "rare": [], "mythic": [], "basic": []}
+    for card in cards:
+        if image_url(card) is None:
+            continue
+        if "Basic Land" in card.get("type_line", ""):
+            buckets["basic"].append(card)
+            continue
+        rarity = card.get("rarity")
+        if rarity in buckets:
+            buckets[rarity].append(card)
+    return buckets
+
+
+# ---------------------------------------------------------------------------
+# Optional set extras: tokens, emblems, dungeon / Ring reference cards
+# ---------------------------------------------------------------------------
+
+def fetch_set_extras(set_codes):
+    """Get printed non-deck cards from Scryfall's associated token sets.
+
+    Token-set association comes from Scryfall set metadata (parent_set_code),
+    not from a guessed token-set code. Keep each distinct printing/artwork.
+    """
+    listing = fetch_json("https://api.scryfall.com/sets")
+    if listing.get("object") == "error":
+        raise RuntimeError("Could not retrieve Scryfall set metadata for extras")
+    wanted = {code.lower() for code in set_codes}
+    token_codes = set()
+    for item in listing.get("data", []):
+        code = item.get("code", "").lower()
+        parent = (item.get("parent_set_code") or "").lower()
+        if item.get("set_type") == "token" and (parent in wanted or code in wanted):
+            token_codes.add(code)
+    # Also search the requested set itself for non-playable/reference printings.
+    # Scryfall's token sets include emblems and cards such as The Ring.
+    extras = {}
+    for code in sorted(token_codes | wanted):
+        print(f"  Checking extras in {code.upper()} ...", flush=True)
+        for card in fetch_cards_query(f"e:{code}", unique="prints"):
+            layout = card.get("layout", "")
+            type_line = card.get("type_line", "")
+            is_extra = (card.get("set_type") == "token" or
+                        layout in ("token", "double_faced_token", "emblem", "art_series") or
+                        any(x in type_line.lower() for x in
+                            ("token", "emblem", "dungeon", "attraction", "sticker", "the ring")))
+            if is_extra and image_url(card):
+                extras[card_key(card)] = card
+    result = list(extras.values())
+    print(f"  Found {len(result)} distinct token/reference printings.", flush=True)
+    return result
+
+
+def build_extras_object(cards, label, face_urls, back_faces, back_url):
+    """Create a separate TTS deck (or single card) for all set extras."""
+    obj = make_deck_json(cards, label, face_urls, back_faces, back_url, [80000])
+    obj["Description"] = "Set tokens, emblems, and reference cards (not booster contents)"
+    obj["Transform"] = tts_transform(x=12, y=1.5, z=0)
+    if len(cards) == 1:
+        single = obj["ContainedObjects"][0]
+        single["CustomDeck"] = obj["CustomDeck"]
+        single["Transform"] = obj["Transform"]
+        single["Description"] = obj["Description"]
+        return single
+    return obj
+
+
+# ---------------------------------------------------------------------------
+# Pack building (classic 15-card draft booster)
+# ---------------------------------------------------------------------------
+
+def sample_no_dupes(pool, count, rng):
+    if len(pool) >= count:
+        return rng.sample(pool, count)
+    return [rng.choice(pool) for _ in range(count)]
+
+
+def build_pack(buckets, rng):
+    pack = []
+    if buckets["mythic"] and rng.random() < MYTHIC_CHANCE:
+        pack.append(rng.choice(buckets["mythic"]))
+    elif buckets["rare"]:
+        pack.append(rng.choice(buckets["rare"]))
+    elif buckets["mythic"]:
+        pack.append(rng.choice(buckets["mythic"]))
+    if buckets["uncommon"]:
+        pack.extend(sample_no_dupes(buckets["uncommon"], 3, rng))
+    if buckets["common"]:
+        pack.extend(sample_no_dupes(buckets["common"], 10, rng))
+    if buckets["basic"]:
+        pack.append(rng.choice(buckets["basic"]))
+    elif buckets["common"]:
+        pack.append(rng.choice(buckets["common"]))
+    return pack
+
+
+def build_pool_pack(cards, count, rng):
+    """Build a rarity-agnostic pack from any Scryfall card pool."""
+    usable = [c for c in cards if image_url(c) is not None]
+    if not usable:
+        return []
+    return sample_no_dupes(usable, count, rng)
+
+
+def build_weighted_pack(cards, rng, common_slots=10, uncommon_slots=3,
+                        rare_slots=1, flex_slots=1, mythic_chance=1 / 8):
+    """Build a traditional-feeling pack from an arbitrary card pool.
+
+    Defaults are 10 commons, 3 uncommons, 1 rare/mythic, and 1 flexible
+    slot (basic land when available). Missing rarity categories gracefully
+    fall back to other eligible cards, which makes this useful for special
+    sets and Commander products that were not designed for booster collation.
+    """
+    usable = [c for c in cards if image_url(c) is not None]
+    if not usable:
+        return []
+
+    buckets = bucket_by_rarity(usable)
+    all_cards = list(usable)
+    pack = []
+
+    def choose_from(preferred, allow_duplicates=False):
+        # Prefer an unused card from the requested rarity; if that category
+        # is absent/exhausted, fall back to any unused card in the pool.
+        used_ids = {card_key(c) for c in pack}
+        candidates = [c for c in preferred if card_key(c) not in used_ids]
+        if not candidates:
+            candidates = [c for c in all_cards if card_key(c) not in used_ids]
+        if not candidates and allow_duplicates:
+            candidates = preferred or all_cards
+        if not candidates:
+            return None
+        return rng.choice(candidates)
+
+    def add_slots(pool, count):
+        for _ in range(max(0, count)):
+            card = choose_from(pool, allow_duplicates=True)
+            if card is not None:
+                pack.append(card)
+
+    add_slots(buckets["common"], common_slots)
+    add_slots(buckets["uncommon"], uncommon_slots)
+
+    for _ in range(max(0, rare_slots)):
+        preferred = (buckets["mythic"] if buckets["mythic"] and
+                     rng.random() < mythic_chance else buckets["rare"])
+        if not preferred:
+            preferred = buckets["rare"] or buckets["mythic"]
+        card = choose_from(preferred, allow_duplicates=True)
+        if card is not None:
+            pack.append(card)
+
+    # Flexible slot: prefer basic lands, then any unused eligible card.
+    add_slots(buckets["basic"] or [], flex_slots)
+
+    # If the selected product lacks enough cards in one or more rarity
+    # buckets, fill to the requested total using unused cards from the pool.
+    target = max(0, common_slots) + max(0, uncommon_slots) + \
+             max(0, rare_slots) + max(0, flex_slots)
+    while len(pack) < target:
+        card = choose_from(all_cards, allow_duplicates=True)
+        if card is None:
+            break
+        pack.append(card)
+    return pack
+
+
+# ---------------------------------------------------------------------------
+# Local images
+# ---------------------------------------------------------------------------
+
+def default_images_dir():
+    if os.name == "nt":
+        return r"C:\Users\Public\TTSDraftImages"
+    return str(Path.home() / "TTSDraftImages")
+
+
+def download_file(url, dest):
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=60) as resp, open(dest, "wb") as f:
+        f.write(resp.read())
+
+
+def file_url(path):
+    return "file:///" + str(path).replace("\\", "/")
+
+
+def card_key(card):
+    return card.get("id") or card.get("name")
+
+
+def download_images(packs, images_dir, set_code):
+    """Download each unique card's front and, when present, reverse face.
+
+    Returns:
+        face_urls: card key -> local front-face URL
+        back_faces: card key -> local reverse-face URL (only DFCs)
+        default_back: local standard MTG card back URL
+        dest: output image directory
+    """
+    dest = Path(images_dir) / set_code.lower()
+    dest.mkdir(parents=True, exist_ok=True)
+    unique = {card_key(c): c for pack in packs for c in pack}
+    double_faced = sum(1 for c in unique.values() if has_distinct_back_face(c))
+    print(f"Downloading {len(unique)} card fronts and {double_faced} reverse faces to {dest} ...")
+    face_urls = {}
+    back_faces = {}
+
+    for i, (key, card) in enumerate(unique.items(), 1):
+        front_target = dest / f"{key}.jpg"
+        front_url = image_url(card)
+        if front_url:
+            if not front_target.exists():
+                download_file(front_url, front_target)
+                time.sleep(0.1)
+            face_urls[key] = file_url(front_target)
+
+        reverse_url = back_image_url(card)
+        if reverse_url:
+            back_target = dest / f"{key}_back.jpg"
+            if not back_target.exists():
+                download_file(reverse_url, back_target)
+                time.sleep(0.1)
+            back_faces[key] = file_url(back_target)
+
+        if i % 50 == 0 or i == len(unique):
+            print(f"  {i}/{len(unique)}")
+
+    back_target = dest / "card_back.jpg"
+    try:
+        if not back_target.exists():
+            download_file(CARD_BACK_URL, back_target)
+        default_back = file_url(back_target)
+    except Exception:
+        default_back = CARD_BACK_URL
+    print(f"  Detected {len(back_faces)} double-faced card(s).")
+    return face_urls, back_faces, default_back, dest
+
+
+# ---------------------------------------------------------------------------
+# Wrapper art
+# ---------------------------------------------------------------------------
+
+def make_wrapper_art(dest_dir, set_code, set_name):
+    """Generate a simple booster-wrapper image. Returns path or None."""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        return None
+
+    # Real draft-booster wrapper proportions (~7.3 x 11 cm)
+    W, H = 460, 700
+    img = Image.new("RGB", (W, H), (24, 20, 40))
+    draw = ImageDraw.Draw(img)
+
+    # Layered background bands for a bit of booster flair
+    for i, color in enumerate([(49, 36, 90), (84, 48, 125), (190, 120, 35)]):
+        draw.polygon([(0, 180 + i * 150), (W, 100 + i * 150),
+                      (W, 160 + i * 150), (0, 240 + i * 150)], fill=color)
+    draw.rectangle([14, 14, W - 14, H - 14], outline=(212, 175, 55), width=4)
+
+    def font(size):
+        for name in ("arialbd.ttf", "arial.ttf", "DejaVuSans-Bold.ttf",
+                     "DejaVuSans.ttf"):
+            try:
+                return ImageFont.truetype(name, size)
+            except Exception:
+                continue
+        return ImageFont.load_default()
+
+    def center_text(y, text, size, fill=(240, 234, 214)):
+        f = font(size)
+        box = draw.textbbox((0, 0), text, font=f)
+        draw.text(((W - (box[2] - box[0])) / 2, y), text, font=f, fill=fill)
+
+    center_text(50, "DRAFT NIGHT", 40)
+    center_text(290, set_code.upper(), 115, fill=(255, 215, 90))
+    # Set name, shrunk to fit if long
+    name = set_name if len(set_name) <= 24 else set_name[:22] + "..."
+    center_text(468, name, 30)
+    center_text(608, "15 CARDS", 28, fill=(200, 195, 180))
+
+    path = Path(dest_dir) / "pack_wrapper.jpg"
+    img.save(path, "JPEG", quality=90)
+    return path
+
+
+ART_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
+
+
+def collect_art_files(folder):
+    return sorted(p for p in Path(folder).iterdir()
+                  if p.is_file() and p.suffix.lower() in ART_EXTENSIONS)
+
+
+def resolve_wrapper_art(pack_art_arg, images_dir, dest, set_code, set_name,
+                        back_url):
+    """Decide which wrapper images to use, copy them into the shared set
+    folder (so the friends-zip includes them), and return a list of file
+    URLs. Priority: --pack-art (file or folder) > auto art library folder
+    > generated art > card back."""
+    sources = []
+    if pack_art_arg:
+        src = Path(pack_art_arg)
+        if not src.exists():
+            sys.exit(f"--pack-art not found: {src}")
+        sources = collect_art_files(src) if src.is_dir() else [src]
+        if not sources:
+            sys.exit(f"No images (.jpg/.png/.webp) found in {src}")
+        print(f"Using {len(sources)} wrapper image(s) from --pack-art {src}")
+    else:
+        auto_dir = Path(images_dir) / "pack_art" / set_code.lower()
+        if auto_dir.is_dir():
+            sources = collect_art_files(auto_dir)
+        if sources:
+            print(f"Using {len(sources)} wrapper image(s) from your art "
+                  f"library: {auto_dir}")
+        else:
+            print(f"No art library folder at {auto_dir} — "
+                  f"using generated wrapper art.")
+
+    if sources:
+        urls = []
+        for i, src in enumerate(sources, 1):
+            target = dest / f"pack_wrapper_{i:02d}{src.suffix.lower()}"
+            shutil.copyfile(src, target)
+            urls.append(file_url(target))
+        return urls
+
+    generated = make_wrapper_art(dest, set_code, set_name)
+    if generated:
+        return [file_url(generated)]
+    print("Pillow not installed — using the card back as wrapper art.")
+    print("For generated wrapper art, run:  pip install pillow")
+    return [back_url]
+
+
+# ---------------------------------------------------------------------------
+# TTS objects
+# ---------------------------------------------------------------------------
+
+def tts_transform(x=0, y=1, z=0, rot_y=180, rot_z=180,
+                  sx=1.0, sy=1.0, sz=1.0):
+    return {"posX": x, "posY": y, "posZ": z,
+            "rotX": 0, "rotY": rot_y, "rotZ": rot_z,
+            "scaleX": sx, "scaleY": sy, "scaleZ": sz}
+
+
+def make_deck_json(pack_cards, label, face_urls, back_faces, back_url, next_deck_id):
+    """The deck a pack spawns when opened — same shape mtg_draft_night uses."""
+    custom_deck, contained, deck_ids = {}, [], []
+    for card in pack_cards:
+        deck_id = next_deck_id[0]
+        next_deck_id[0] += 1
+        # For double-faced cards, TTS uses the second face as the card's
+        # reverse image. UniqueBack must be enabled so TTS does not substitute
+        # the shared deck back. Ordinary cards retain the normal MTG back.
+        reverse_url = back_faces.get(card_key(card), back_url)
+        custom_deck[str(deck_id)] = {
+            "FaceURL": face_urls[card_key(card)],
+            "BackURL": reverse_url,
+            "NumWidth": 1, "NumHeight": 1,
+            "BackIsHidden": True, "UniqueBack": card_key(card) in back_faces,
+        }
+        contained.append({
+            "Name": "Card",
+            "Nickname": card.get("name", "Unknown"),
+            "Description": card.get("type_line", ""),
+            "CardID": deck_id * 100,
+            "Transform": tts_transform(),
+            "ContainedObjects": [],
+        })
+        deck_ids.append(deck_id * 100)
+    return {
+        "Name": "DeckCustom",
+        "Nickname": label,
+        "Description": "Fresh from the pack",
+        "Transform": tts_transform(),
+        "DeckIDs": deck_ids,
+        "CustomDeck": custom_deck,
+        "ContainedObjects": contained,
+    }
+
+
+PACK_LUA = """\
+function onLoad()
+    self.createButton({
+        click_function = "openPack",
+        function_owner = self,
+        label = "Open",
+        position = {0, 0.6, 1.05},
+        rotation = {0, 0, 0},
+        width = 550,
+        height = 240,
+        font_size = 140,
+        color = {0.15, 0.12, 0.25},
+        font_color = {1, 0.85, 0.35},
+        tooltip = "Tear it open!"
+    })
+end
+
+function openPack()
+    local pos = self.getPosition()
+    spawnObjectJSON({
+        json = deckJson,
+        position = {pos.x, pos.y + 1.5, pos.z},
+        rotation = {0, 180, 180},
+    })
+    self.destruct()
+end
+
+deckJson = [=====[
+%s
+]=====]
+"""
+
+
+def make_pack_object(deck_json_obj, pack_label, position, wrapper_url):
+    deck_str = json.dumps(deck_json_obj)
+    if "]=====]" in deck_str:  # paranoia: never collide with Lua's long bracket
+        deck_str = deck_str.replace("]=====]", "] =====]")
+    if len(position) == 3:
+        x, y, z = position
+    else:
+        x, z = position
+        y = 1.0
+    return {
+        "Name": "CardCustom",
+        "Nickname": pack_label,
+        "Description": "Sealed booster — click Open to crack it",
+        # face-up so the wrapper art shows; scaled to real booster
+        # proportions (slightly narrower and taller than a card)
+        "Transform": tts_transform(x=x, y=y, z=z, rot_z=0, sx=1.2, sy=1.0, sz=1.3),
+        "CardID": 100,
+        "CustomDeck": {
+            "1": {
+                "FaceURL": wrapper_url,
+                "BackURL": wrapper_url,
+                "NumWidth": 1, "NumHeight": 1,
+                "BackIsHidden": False, "UniqueBack": False,
+            }
+        },
+        "LuaScript": PACK_LUA % deck_str,
+        "ContainedObjects": [],
+    }
+
+
+def grid_positions(count, per_row=4, spacing_x=4.2, spacing_z=5.8):
+    positions = []
+    for i in range(count):
+        row, col = divmod(i, per_row)
+        x = (col - (per_row - 1) / 2) * spacing_x
+        z = row * -spacing_z
+        positions.append((x, z))
+    return positions
+
+
+def build_saved_object(packs, set_code, face_urls, back_faces, back_url, wrapper_urls, rng,
+                       layout="grid", stack_spacing=0.08):
+    """Build TTS saved objects arranged as a grid or a vertical stack."""
+    objects = []
+    next_deck_id = [1]
+    per_row = 4 if len(packs) <= 16 else 6
+    if layout == "stack":
+        # Keep X/Z aligned and raise each pack slightly above the previous one.
+        # A small vertical gap prevents the physics engine from merging them.
+        positions = [(0.0, 1.0 + i * stack_spacing, 0.0)
+                     for i in range(len(packs))]
+    else:
+        positions = grid_positions(len(packs), per_row=per_row)
+    for i, pack in enumerate(packs):
+        label = f"{set_code.upper()} Booster {i + 1}"
+        deck = make_deck_json(pack, label, face_urls, back_faces, back_url, next_deck_id)
+        wrapper = rng.choice(wrapper_urls)
+        objects.append(make_pack_object(deck, label, positions[i], wrapper))
+    return {"ObjectStates": objects}
+
+
+# ---------------------------------------------------------------------------
+# Scryfall set discovery
+# ---------------------------------------------------------------------------
+
+def list_scryfall_sets(include_normal=False):
+    """Print useful Scryfall set codes so the script can discover new products."""
+    data = fetch_json("https://api.scryfall.com/sets")
+    if data.get("object") == "error":
+        sys.exit("Could not retrieve Scryfall's set list.")
+
+    sets = data.get("data", [])
+    special_types = {
+        "masters", "draft_innovation", "commander", "box",
+        "from_the_vault", "spellbook", "premium_deck", "duel_deck",
+        "arsenal", "promo", "funny", "starter", "planechase",
+        "archenemy", "treasure_chest",
+    }
+    for s in sets:
+        if include_normal or s.get("set_type") in special_types or \
+                s.get("code", "").lower().startswith("sl"):
+            print(f"{s.get('code','').upper():5}  {s.get('name','')}  "
+                  f"[{s.get('set_type','')}, {s.get('card_count',0)} cards]")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Generate clickable, openable MTG booster packs for TTS.")
+    parser.add_argument("--set", required=False, dest="set_codes", nargs="+",
+                        help="One or more Scryfall set codes, e.g. --set dtk ktk frf")
+    parser.add_argument("--query", default=None,
+                        help='Custom Scryfall query, e.g. "set:sld" or "set:sld cn:500". '
+                        "Overrides --set card selection.")
+    parser.add_argument("--mode", choices=("draft", "pool", "weighted"), default="draft",
+                        help="draft = conventional rarity slots; pool = equal-chance "
+                             "random selection; weighted = traditional-feeling rarity "
+                             "slots with fallback for special products (default: draft)")
+    parser.add_argument("--extras", action="store_true",
+                        help="Add a separate TTS deck with the set's tokens, emblems and reference cards")
+    parser.add_argument("--extras-only", action="store_true",
+                        help="Generate only the set's tokens, emblems and reference cards; no boosters")
+    parser.add_argument("--include-promos", action="store_true",
+                        help="Allow promotional printings from the set and its p-prefixed promo set")
+    parser.add_argument("--include-variants", action="store_true",
+                        help="Allow showcase, borderless, full-art, and other alternate printings")
+    parser.add_argument("--special-chance", type=float, default=0.15,
+                        help="Chance to replace an eligible card with special printing (default: 0.15)")
+    parser.add_argument("--all-printings", action="store_true",
+                        help="In pool/query mode, include distinct Scryfall printings rather than one per card")
+    parser.add_argument("--cards-per-pack", type=int, default=15,
+                        help="Cards per pool pack (default: 15)")
+    parser.add_argument("--common-slots", type=int, default=10,
+                        help="Weighted mode: common slots (default: 10)")
+    parser.add_argument("--uncommon-slots", type=int, default=3,
+                        help="Weighted mode: uncommon slots (default: 3)")
+    parser.add_argument("--rare-slots", type=int, default=1,
+                        help="Weighted mode: rare/mythic slots (default: 1)")
+    parser.add_argument("--flex-slots", type=int, default=1,
+                        help="Weighted mode: flexible slots, prefers basic lands (default: 1)")
+    parser.add_argument("--mythic-chance", type=float, default=0.125,
+                        help="Weighted mode: chance 0-1 for rare slot to upgrade to mythic (default: 0.125)")
+    parser.add_argument("--list-special-sets", action="store_true",
+                        help="List Scryfall's non-standard/special set codes and exit")
+    parser.add_argument("--list-all-sets", action="store_true",
+                        help="List every Scryfall set code and exit")
+    parser.add_argument("--players", type=int, default=4)
+    parser.add_argument("--packs-per-player", type=int, default=3)
+    parser.add_argument("--packs", type=int, default=None,
+                        help="Total packs (overrides players x packs-per-player)")
+    parser.add_argument("--layout", choices=("grid", "stack"), default="grid",
+                        help="Spawn packs in a spaced grid (default) or one vertical stack")
+    parser.add_argument("--stack-spacing", type=float, default=0.08,
+                        help="Vertical spacing between stacked packs in TTS units (default: 0.08)")
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--out", default=None,
+                        help="Output JSON (default: boosters_<set>.json)")
+    parser.add_argument("--images-dir", default=None,
+                        help="Folder for downloaded images "
+                             "(default: C:\\Users\\Public\\TTSDraftImages)")
+    parser.add_argument("--pack-art", default=None,
+                        help="Your own wrapper image file OR a folder of images "
+                             "(overrides the pack_art/<set> art library)")
+    args = parser.parse_args()
+
+    if args.list_special_sets or args.list_all_sets:
+        list_scryfall_sets(include_normal=args.list_all_sets)
+        return
+
+    if (args.extras or args.extras_only) and not args.set_codes:
+        sys.exit("--extras and --extras-only require --set CODE [CODE ...].")
+    if not args.set_codes and not args.query:
+        sys.exit("Provide --set CODE [CODE ...] or --query 'SCRYFALL QUERY'.")
+    if not 0 <= args.special_chance <= 1:
+        sys.exit("--special-chance must be between 0 and 1.")
+    if args.cards_per_pack < 1:
+        sys.exit("--cards-per-pack must be at least 1.")
+    if min(args.common_slots, args.uncommon_slots, args.rare_slots,
+           args.flex_slots) < 0:
+        sys.exit("Weighted slot counts cannot be negative.")
+    if not 0 <= args.mythic_chance <= 1:
+        sys.exit("--mythic-chance must be between 0 and 1.")
+    if args.mode == "weighted" and not (args.common_slots + args.uncommon_slots +
+                                        args.rare_slots + args.flex_slots):
+        sys.exit("Weighted mode must have at least one slot.")
+
+    if args.extras_only:
+        codes = [c.lower() for c in args.set_codes]
+        set_code = "_".join(codes)
+        images_dir = args.images_dir or default_images_dir()
+        extras = fetch_set_extras(codes)
+        if not extras:
+            sys.exit("No token, emblem or reference card printings found for this set.")
+        extra_fronts, extra_backs, extra_back, dest = download_images(
+            [extras], images_dir, set_code)
+        obj = build_extras_object(extras, f"{set_code.upper()} Tokens & Extras",
+                                  extra_fronts, extra_backs, extra_back)
+        out_path = args.out or f"boosters_{set_code.lower()}_extras.json"
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump({"ObjectStates": [obj]}, f, indent=2)
+        zip_path = shutil.make_archive(f"draft_images_{set_code.lower()}", "zip",
+                                       root_dir=dest.parent, base_dir=dest.name)
+        print(f"\nDone! Wrote {out_path} ({len(extras)} extras).")
+        print(f"Images archive: {zip_path}")
+        print("Copy the JSON into Documents/My Games/Tabletop Simulator/Saves/Saved Objects/")
+        return
+
+    rng = random.Random(args.seed)
+    total_packs = args.packs if args.packs is not None else \
+        args.players * args.packs_per_player
+    if total_packs < 1:
+        sys.exit("Pack count must be at least 1.")
+    if args.stack_spacing <= 0:
+        sys.exit("--stack-spacing must be greater than 0.")
+
+    if args.query:
+        print(f"Fetching Scryfall query: {args.query}")
+        cards = fetch_cards_query(args.query, unique="prints" if args.all_printings else "cards")
+        if not cards:
+            sys.exit(f"No cards found for Scryfall query: {args.query}")
+        set_name = f"Custom: {args.query}"
+        set_code = "_".join(c.lower() for c in args.set_codes) if args.set_codes else "custom"
+        released_at = ""
+        card_count = len(cards)
+    else:
+        codes = [c.lower() for c in args.set_codes]
+        set_code = "_".join(codes)
+        names = []
+        cards = []
+        seen_ids = set()
+        card_count = 0
+        special_cards = []
+        for code in codes:
+            print(f"Fetching '{code}' from Scryfall...")
+            name, released_at, listed_count = fetch_set_meta(code)
+            set_cards = fetch_set_cards(
+                code, released_at, use_booster_filter=(args.mode == "draft"))
+            if args.include_promos or args.include_variants:
+                specials = fetch_special_printings(code, args.include_promos, args.include_variants)
+                special_cards.extend(specials)
+                print(f"  Found {len(specials)} eligible special printings for {code.upper()}")
+            names.append(name)
+            card_count += listed_count
+            for card in set_cards:
+                card_id = card.get("id")
+                if card_id and card_id in seen_ids:
+                    continue
+                if card_id:
+                    seen_ids.add(card_id)
+                cards.append(card)
+        set_name = " + ".join(names)
+
+    if card_count:
+        label = "card pool" if args.mode in ("pool", "weighted") or args.query else "draftable cards"
+        print(f"  {set_name}: pulled {len(cards)} {label} "
+              f"(combined set lists {card_count})")
+
+    if args.mode == "pool":
+        if len(cards) < args.cards_per_pack:
+            print(f"  Warning: only {len(cards)} cards are available; "
+                  f"packs may contain duplicates.")
+        print(f"  Custom pool mode: {args.cards_per_pack} cards per pack")
+        packs = [build_pool_pack(cards, args.cards_per_pack, rng)
+                 for _ in range(total_packs)]
+    elif args.mode == "weighted":
+        total_slots = (args.common_slots + args.uncommon_slots +
+                       args.rare_slots + args.flex_slots)
+        print("  Weighted mode slots: "
+              f"{args.common_slots} common, {args.uncommon_slots} uncommon, "
+              f"{args.rare_slots} rare/mythic, {args.flex_slots} flexible "
+              f"({total_slots} cards per pack; mythic upgrade {args.mythic_chance:.1%})")
+        packs = [build_weighted_pack(
+                    cards, rng, args.common_slots, args.uncommon_slots,
+                    args.rare_slots, args.flex_slots, args.mythic_chance)
+                 for _ in range(total_packs)]
+    elif args.query:
+        if len(cards) < args.cards_per_pack:
+            print(f"  Warning: only {len(cards)} cards are available; "
+                  f"packs may contain duplicates.")
+        print(f"  Custom query pool mode: {args.cards_per_pack} cards per pack")
+        packs = [build_pool_pack(cards, args.cards_per_pack, rng)
+                 for _ in range(total_packs)]
+    else:
+        buckets = bucket_by_rarity(cards)
+        print(f"  {len(buckets['common'])} commons, {len(buckets['uncommon'])} "
+              f"uncommons, {len(buckets['rare'])} rares, {len(buckets['mythic'])} "
+              f"mythics, {len(buckets['basic'])} basics")
+        print(f"Building {total_packs} draft-style packs...")
+        packs = [build_pack(buckets, rng) for _ in range(total_packs)]
+
+    if not args.query and (args.include_promos or args.include_variants):
+        swaps = substitute_specials(packs, special_cards, args.special_chance, rng)
+        print(f"  Substituted {swaps} promotional/alternate-art card printings")
+
+    images_dir = args.images_dir or default_images_dir()
+    face_urls, back_faces, back_url, dest = download_images(packs, images_dir, set_code)
+
+    wrapper_urls = resolve_wrapper_art(args.pack_art, images_dir, dest,
+                                       set_code, set_name, back_url)
+
+    saved_object = build_saved_object(packs, set_code, face_urls,
+                                      back_faces, back_url, wrapper_urls, rng,
+                                      layout=args.layout,
+                                      stack_spacing=args.stack_spacing)
+    if args.extras:
+        codes = [c.lower() for c in args.set_codes]
+        extras = fetch_set_extras(codes)
+        if extras:
+            extra_fronts, extra_backs, extra_back, _ = download_images(
+                [extras], images_dir, set_code)
+            extra_obj = build_extras_object(
+                extras, f"{set_code.upper()} Tokens & Extras",
+                extra_fronts, extra_backs, extra_back)
+            saved_object["ObjectStates"].append(extra_obj)
+            print(f"  Added a separate TTS object with {len(extras)} set extras.")
+        else:
+            print("  No set extras found; booster output is unchanged.")
+    out_path = args.out or f"boosters_{set_code.lower()}.json"
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(saved_object, f, indent=2)
+
+    zip_path = shutil.make_archive(
+        f"draft_images_{set_code.lower()}", "zip",
+        root_dir=dest.parent, base_dir=dest.name)
+
+    rare_names = [p[0].get("name", "?") for p in packs if p]
+    print(f"\nDone! Wrote {out_path}")
+    print(f"Rare slots: {', '.join(rare_names)}")
+    print("\nTo use in Tabletop Simulator:")
+    print("  1. Copy the JSON into  Documents/My Games/Tabletop Simulator/"
+          "Saves/Saved Objects/")
+    print("  2. Objects -> Saved Objects -> click your file")
+    print(f"  3. Pack layout: {args.layout}. Sealed packs spawn face-up. "
+          "Click a pack's Open button to crack it — the wrapper vanishes "
+          "and the cards drop in its place!")
+    print(f"\nFor your friends: send {zip_path}")
+    print(f"  They extract it into:  {Path(images_dir)}")
+    print(f"  (must end up at {Path(images_dir) / set_code.lower()})")
+    print(f"\nArt library tip: drop wrapper images into")
+    print(f"  {Path(images_dir) / 'pack_art' / set_code.lower()}")
+    print(f"  and future runs for this set will use them automatically,")
+    print(f"  giving each pack a randomly chosen wrapper.")
+
+
+if __name__ == "__main__":
+    main()
